@@ -86,5 +86,9 @@
   "files.associations": {
     "*.studiorc": "shellscript"
   },
-  "files.enableTrash": false
+  "files.enableTrash": false,
+  "docwriter.progress.trackTypes": true,
+  "docwriter.progress.trackClasses": true,
+  "docwriter.progress.trackFunctions": true,
+  "docwriter.progress.trackMethods": false
 }
