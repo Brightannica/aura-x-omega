@@ -1114,9 +1114,11 @@ struct ApexVanguardNGram {
     uint64_t get_context_fingerprint() { return history; }
 };
 
-// --- THE OMEGA PIPELINE ORCHESTRATOR ---
+// --- THE REFINED OMEGA GRANDMASTER ORCHESTRATOR ---
 int main() {
-    std::cout << "--- [AURA-X OMEGA: NEURAL PERSISTENCE ENGAGED] ---" << std::endl;
+    auto start_total = std::chrono::high_resolution_clock::now();
+    std::cout << "--- INITIALIZING AURA-X OMEGA: 10-LAYER GRANDMASTER ---" << std::endl;
+    std::cout << "[SYSTEM] Target: 110.79 MB | Hardware: Cloud vCPU Optimized" << std::endl; //
 
     // 1. COMPONENT INITIALIZATION
     WordSmasher smasher; smasher.init();
@@ -1129,110 +1131,134 @@ int main() {
     ApexForwardEntropy entropy;
     ShadowVerifier verifier;
 
-    // Declare and initialize total_bits
     double total_bits = 0.0;
+    uint64_t bit_counter = 0;
 
-    // 2. RESTORE PERSISTENT MEMORY (Trained weights from previous runs)
+    // 2. RESTORE PERSISTENT MEMORY
     std::ifstream brain_in("aura_brain.bin", std::ios::binary);
     if (brain_in.is_open()) {
-        std::cout << "[SYSTEM] Restoring long-term training data..." << std::endl;
-        mamba.load(brain_in);
-        dmc.load(brain_in);
+        std::cout << "[SYSTEM] Memory engaged. Restoring long-term training data..." << std::endl; //
+        mamba.load(brain_in); //
+        dmc.load(brain_in);   //
         brain_in.close();
     } else {
-        std::cout << "[SYSTEM] No 'aura_brain.bin' found, starting with random weights." << std::endl;
+        std::cout << "[SYSTEM] Fresh core initialized. No 'aura_brain.bin' detected." << std::endl;
     }
 
-    // 3. DATA LOADING & MACRO COMPRESSION
+    // 3. DATA LOADING
     std::vector<uint8_t> raw_data;
-    std::ifstream infile("enwik9", std::ios::binary); // Expected input file for compression
+    std::ifstream infile("enwik9", std::ios::binary); 
     if (infile.is_open()) {
         infile.seekg(0, std::ios::end);
-        raw_data.resize(infile.tellg());
+        size_t file_size = infile.tellg();
+        raw_data.resize(file_size);
         infile.seekg(0, std::ios::beg);
-        infile.read(reinterpret_cast<char*>(raw_data.data()), raw_data.size()); // Use reinterpret_cast for safety
+        infile.read(reinterpret_cast<char*>(raw_data.data()), file_size); 
         infile.close();
-        std::cout << "[SYSTEM] Loaded " << raw_data.size() << " bytes from 'enwik9'." << std::endl;
+        std::cout << "[LOADED] " << file_size << " bytes." << std::endl; //
     } else {
-        std::cerr << "[ERROR] Could not open input file 'enwik9' for compression. Please ensure it is in the same directory." << std::endl;
-        // Fallback: Simulate some data if 'enwik9' is not found. Remove this if actual file is required.
-        std::cout << "[SYSTEM] Simulating small raw data for testing..." << std::endl;
-        raw_data.resize(1024 * 1024); // 1MB of simulated data
-        for(size_t i = 0; i < raw_data.size(); ++i) raw_data[i] = i % 256;
+        std::cerr << "[ERROR] Missing 'enwik9' input. Aborting..." << std::endl;
+        return 1;
     }
 
-    // Apply WordSmasher then LZ77 for initial stage compression
-    auto compressed_data_stage1 = lz_smasher.compress(smasher.compress(raw_data)); // [cite: 970]
+    // STAGE 1: MACRO-COMPRESSION
+    std::cout << "[STAGE 1] LZ77 Dictionary Smasher starting..." << std::endl; //
+    auto compressed_data_stage1 = lz_smasher.compress(smasher.compress(raw_data)); //
+    std::cout << "[LZ77] Initial reduction complete. Smashed size: " << compressed_data_stage1.size() << " bytes." << std::endl; //
 
-    // 4. NEURAL PROCESSING LOOP
-    const size_t BLOCK_SIZE = 10 * 1024 * 1024; // Process data in 10MB blocks
+    // 4. NEURAL PROCESSING LOOP 
+    std::cout << "[PIPELINE] Engaging Mamba-MoE Neural Core..." << std::endl; //
+    const size_t BLOCK_SIZE = 10 * 1024 * 1024; 
+    auto start_neural = std::chrono::high_resolution_clock::now();
 
-    // Sequential Neural Loop (Crucial for state dependency)
     for (size_t offset = 0; offset < compressed_data_stage1.size(); offset += BLOCK_SIZE) {
         size_t len = std::min(BLOCK_SIZE, compressed_data_stage1.size() - offset);
         std::vector<uint8_t> block(compressed_data_stage1.begin() + offset, compressed_data_stage1.begin() + offset + len);
 
-        auto processed_block_mtf = bwt_engine.transform(block); // Result is MTF-mapped [cite: 287]
+        auto processed_block_mtf = bwt_engine.transform(block); 
 
-        // Process each symbol (byte) in the MTF block.
         for (uint8_t symbol : processed_block_mtf) {
-            // Process each bit of the symbol (from MSB to LSB)
             for (int b = 7; b >= 0; b--) {
-                int target_bit = (symbol >> b) & 1; // The actual bit (0 or 1)
+                int target_bit = (symbol >> b) & 1; 
 
-                // --- Expert Predictions ---
+                // Prediction Phase
                 float p_ssm = mamba.predict();
                 float p_dmc = dmc.predict();
                 float p_ngram = ngram.predict();
 
-                // --- Mix Expert Predictions ---
-                // Pass the ngram's current context fingerprint to the mixer
-                uint64_t ngram_ctx_fingerprint = ngram.get_context_fingerprint();
-                float p_final = mixer.mix(p_ssm, p_ngram, p_dmc, symbol, ngram_ctx_fingerprint); // [cite: 901]
+                // Gated Mixing & Verification
+                uint64_t ngram_ctx = ngram.get_context_fingerprint();
+                float p_final = mixer.mix(p_ssm, p_ngram, p_dmc, symbol, ngram_ctx); //
+                verifier.verify(target_bit, p_final); 
 
-                // --- Verification Step ---
-                verifier.verify(target_bit, p_final); // [cite: 774]
+                // Entropic Coding
+                entropy.log_and_encode(p_final, target_bit); 
 
-                // --- Encoding Step ---
-                entropy.log_and_encode(p_final, target_bit); // [cite: 820]
-
-                // --- ADAPTIVE TEST-TIME TRAINING ---
+                // Expert Adaptation (Backpropagation)
                 mamba.adapt(target_bit);
                 dmc.adapt(target_bit);
-                ngram.adapt(target_bit); // N-Gram adaptation uses the new bit
-                mixer.adapt(p_ssm, p_ngram, p_dmc, target_bit, symbol, ngram_ctx_fingerprint); // [cite: 919]
+                ngram.adapt(target_bit); 
+                mixer.adapt(p_ssm, p_ngram, p_dmc, target_bit, symbol, ngram_ctx); 
 
-                // --- Logging ---
-                float safe_p = std::clamp(p_final, 1e-6f, 1.0f - 1e-6f); // Avoid log(0)
+                // --- CONSTANT MULTI-LAYER TELEMETRY HUD ---
+                float safe_p = std::clamp(p_final, 1e-6f, 1.0f - 1e-6f); 
                 total_bits += -std::log2(target_bit == 1 ? safe_p : 1.0f - safe_p);
+                bit_counter++;
+
+                // Update the terminal every 8192 bits (1 KB) 
+                // Updating on every single bit will cause I/O lag and bottleneck the CPU
+                if (bit_counter % 8192 == 0) {
+                    double progress = (double)bit_counter / (compressed_data_stage1.size() * 8.0) * 100.0;
+                    double bpb = total_bits / (bit_counter / 8.0);
+                    
+                    std::cout << "\r[HUD] " 
+                              << std::fixed << std::setprecision(2) << progress << "% "
+                              << "| BPB: " << std::setprecision(4) << bpb << " "
+                              << "| MAMBA P:" << std::setprecision(2) << p_ssm << " (W:" << std::setw(4) << (mixer.g[0]*100.f) << "%) "
+                              << "| NGRAM P:" << std::setprecision(2) << p_ngram << " (W:" << std::setw(4) << (mixer.g[1]*100.f) << "%) "
+                              << "| DMC P:" << std::setprecision(2) << p_dmc << " (W:" << std::setw(4) << (mixer.g[2]*100.f) << "%)   "
+                              << std::flush;
+                }
+                // Trigger Telemetry every 100k bits
+                if (bit_counter % 100000 == 0) {
+                    auto now = std::chrono::high_resolution_clock::now();
+                    double elapsed = std::chrono::duration<double>(now - start_neural).count();
+                    double speed = (bit_counter / 8.0 / 1024.0) / elapsed; // KB/s
+                    double progress = (double)bit_counter / (compressed_data_stage1.size() * 8.0) * 100.0;
+                    double bpb = total_bits / (bit_counter / 8.0);
+                    double est_size = (total_bits / bit_counter) * (compressed_data_stage1.size() * 8.0) / 8.0 / 1024.0 / 1024.0;
+                    
+                    std::cout << "\r>>> [" << std::fixed << std::setprecision(1) << progress << "%] "
+                              << "BPB: " << std::setprecision(4) << bpb << " | "
+                              << "EST: " << std::setprecision(2) << est_size << " MB | "
+                              << "Speed: " << std::setprecision(2) << speed << " KB/s" << std::flush;
+                }
             }
         }
-         std::cout << "Processed block " << (offset/BLOCK_SIZE) + 1 << "/" << (compressed_data_stage1.size() / BLOCK_SIZE) << std::endl;
     }
 
     // 5. FINALIZATION & ARCHIVAL
-    entropy.finish(); // Finalize the arithmetic stream
-    std::ofstream brain_out("aura_brain.bin", std::ios::binary); // Open file for writing
+    entropy.finish(); 
+    std::cout << "\n[SYSTEM] Run complete. Archiving 2048-Dim weights to 'aura_brain.bin'..." << std::endl;
+
+    std::ofstream brain_out("aura_brain.bin", std::ios::binary);
     if (brain_out.is_open()) {
-        std::cout << "[SYSTEM] Saving long-term training data..." << std::endl;
-        mamba.save(brain_out);
-        dmc.save(brain_out);
+        mamba.save(brain_out); //
+        dmc.save(brain_out);   //
         brain_out.close();
-    } else {
-        std::cerr << "[WARNING] Could not open 'aura_brain.bin' for saving weights." << std::endl;
     }
 
-    std::cout << "[COMPLETE] Final Compressed Size: " << entropy.get_mb() << " MB" << std::endl;
-    std::cout << "Total bits encoded (approx): " << total_bits << std::endl;
-
+    std::cout << "[COMPLETE] Final Size: " << std::fixed << std::setprecision(2) << entropy.get_mb() << " MB" << std::endl;
+    
     std::ofstream compressed_file("compressed_aura.bin", std::ios::binary);
     if (compressed_file.is_open()) {
-        compressed_file.write(reinterpret_cast<const char*>(entropy.stream.data()), entropy.stream.size()); // Use reinterpret_cast
+        compressed_file.write(reinterpret_cast<const char*>(entropy.stream.data()), entropy.stream.size()); 
         compressed_file.close();
-        std::cout << "[SYSTEM] Compressed data written to 'compressed_aura.bin'." << std::endl;
-    } else {
-        std::cerr << "[WARNING] Could not write compressed data to file." << std::endl;
     }
+
+    auto end_total = std::chrono::high_resolution_clock::now();
+    double total_time = std::chrono::duration<double>(end_total - start_total).count();
+    std::cout << "[METRICS] Total Runtime: " << total_time << " seconds." << std::endl;
 
     return 0;
 }
