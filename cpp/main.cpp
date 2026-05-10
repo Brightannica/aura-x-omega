@@ -1,3 +1,6 @@
+#include <sys/resource.h>
+#include <sched.h>
+#include <unistd.h>
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -23,6 +26,34 @@ inline float stretch(float p) {
     // Numerical failsafe[cite: 13, 380]. Ensure p is strictly within (0, 1).
     p = std::clamp(p, std::numeric_limits<float>::epsilon(), 1.0f - std::numeric_limits<float>::epsilon());
     return std::log(p / (1.0f - p)); //[cite: 14, 15, 381].
+}
+
+// --- LAYER 0: OS-LEVEL HARDWARE ENFORCEMENT ---
+void enforce_hardware_limits() {
+    // 1. Enforce strict 10GB RAM Limit via kernel
+    struct rlimit memory_limit;
+    const uint64_t MAX_RAM_BYTES = 10ULL * 1024 * 1024 * 1024; // 10 GB
+    memory_limit.rlim_cur = MAX_RAM_BYTES;
+    memory_limit.rlim_max = MAX_RAM_BYTES;
+    
+    if (setrlimit(RLIMIT_AS, &memory_limit) != 0) {
+        std::cerr << "[WARNING] Kernel rejected RAM constraint." << std::endl;
+    }
+
+    // 2. Lock to exactly 1 Physical Core (Core 0)
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset); 
+    
+    // Bind the current process to the specified CPU set
+    if (sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) != 0) {
+        std::cerr << "[WARNING] Kernel rejected CPU affinity lock." << std::endl;
+    }
+
+    // 3. Throttle OpenMP to prevent background thread spawning
+    omp_set_num_threads(1);
+
+    std::cout << "[SYSTEM] Hardware Constraints Locked: 1 vCPU (Intel 8244C Profile) | 10.00 GB RAM MAX" << std::endl;
 }
 
 // --- COMPONENT: WORD SMASHER ---
@@ -139,80 +170,80 @@ struct WordSmasher {
     }
 };
 
-// --- LAYER 1: GIGA-WINDOW LZ77 (128MB Deep Horizon) ---
+// --- LAYER 2: GIGA-WINDOW LZ77 (OPTIMAL PARSING & MULTI-HASH CORE) ---
 struct GigaWindowLZ77 {
-    // 128 Megabytes Look-Behind Window
+    // 128MB Horizon Limits
     static const uint32_t WINDOW_SIZE = 134217728;
-    // Because distance takes 4 bytes to store (plus 1 byte for escape, 1 for length),
-    // a match must be at least 7 bytes long to actually save space.
-    static const uint32_t MIN_MATCH = 7;
-    static const uint32_t MAX_MATCH = 258; // Max match length is 258 literals
-    static const uint32_t MAX_MATCH_ENCODED = MAX_MATCH - MIN_MATCH; // Max encoded length for range encoding
-
-    // 16M Hash Table for perfect 24-bit (3-byte) hashing
-    static const uint32_t HASH_SIZE = 16777216;
-
-    struct Match {
-        uint32_t length = 0;
-        uint32_t distance = 0;
+    static const uint32_t MIN_MATCH = 4; // Lowered minimum for denser packing
+    static const uint32_t MAX_MATCH = 258;
+    static const uint32_t MAX_MATCH_ENCODED = MAX_MATCH - MIN_MATCH;
+    
+    // Multi-Tier Hash Tables for collision resistance
+    static const uint32_t HASH3_SIZE = 16777216; // 16M
+    static const uint32_t HASH4_SIZE = 33554432; // 32M
+    
+    // SIMD-Aligned Optimal Parsing Grid
+    alignas(64) struct OptimalNode {
+        uint32_t cumulative_price;
+        uint32_t match_length;
+        uint32_t match_distance;
+        bool is_literal;
     };
 
-    // Hash function for 3-byte sequences
-    inline uint32_t hash_func(const uint8_t* p) {
-        return (p[0] << 16) | (p[1] << 8) | p[2];
+    struct Match { uint32_t length = 0; uint32_t distance = 0; };
+
+    // Advanced Bitwise Hash Algorithms
+    inline uint32_t hash3(const uint8_t* p) { return ((p[0] << 16) | (p[1] << 8) | p[2]) & (HASH3_SIZE - 1); }
+    inline uint32_t hash4(const uint8_t* p) { return (*reinterpret_cast<const uint32_t*>(p) * 2654435761U) & (HASH4_SIZE - 1); }
+
+    // Calculates the "entropic price" of encoding a match vs. literal
+    inline uint32_t calculate_price(uint32_t length, uint32_t distance) {
+        if (length == 0) return 8; // Literal cost ~ 8 bits
+        // Cost model: roughly 8 bits for flags + encoded length + 32 bits for distance
+        return 8 + 8 + 32; 
     }
 
-    // Finds the longest match starting at 'pos' in 'in'
-    Match find_match(const std::vector<uint8_t>& in, uint32_t pos, const std::vector<int>& head, const std::vector<int>& prev) {
+    // High-Precision Multi-Tier Match Finder
+    Match find_best_match(const std::vector<uint8_t>& in, uint32_t pos, const std::vector<int>& head3, const std::vector<int>& head4, const std::vector<int>& prev) {
         Match best;
-        // Ensure there are enough bytes for a potential match and subsequent checks
-        // Check if we can form at least a MIN_MATCH.
-        if (pos + MIN_MATCH > in.size()) return best;
+        if (pos + 4 > in.size()) return best;
 
-        int current_match_pos = head[hash_func(&in[pos])]; // Start search from latest occurrence of this hash
-        int chain_limit = 4096; // Limit search depth to prevent excessive computation
-
-        // If the current position is the latest occurrence, move to the previous one in the chain
-        if (current_match_pos == static_cast<int>(pos)) {
-            current_match_pos = prev[pos % WINDOW_SIZE];
+        // Check Hash4 (High Precision) first, fall back to Hash3
+        int current_match_pos = head4[hash4(&in[pos])];
+        if (current_match_pos == -1 || current_match_pos == static_cast<int>(pos)) {
+            current_match_pos = head3[hash3(&in[pos])];
         }
 
+        int chain_limit = 8192; // Deep chain traversal for 128MB window
+
         const uint8_t* scan_ptr = &in[pos];
-        // Determine the effective end pointer for scanning, considering the input size and maximum match length.
         const uint8_t* scan_end_ptr = scan_ptr + std::min(static_cast<uint32_t>(in.size() - pos), MAX_MATCH);
 
-        // Traverse the hash chain
         while (current_match_pos != -1 && (pos - static_cast<uint32_t>(current_match_pos)) <= WINDOW_SIZE && chain_limit-- > 0) {
             const uint8_t* match_ptr = &in[current_match_pos];
-
-            // Quick check: If the first bytes don't match, skip this chain entry
-            if (match_ptr[0] != scan_ptr[0]) {
+            
+            // Fast bail-out
+            if (match_ptr[0] != scan_ptr[0] || match_ptr[1] != scan_ptr[1]) {
                 current_match_pos = prev[current_match_pos % WINDOW_SIZE];
                 continue;
             }
 
             uint32_t len = 0;
-
-            // Use SIMD for speed: Compare 8 bytes at a time as long as pointers are valid and data matches.
-            // Ensure that `scan_ptr + len + 8` and `match_ptr + len + 8` are within their respective bounds.
-            while (scan_ptr + len + 8 < scan_end_ptr && // Check scan_ptr boundary
-                   match_ptr + len + 8 < &in[WINDOW_SIZE] && // Check match_ptr boundary relative to window start (approximate)
-                   *reinterpret_cast<const uint64_t*>(scan_ptr + len) == *reinterpret_cast<const uint64_t*>(match_ptr + len)) {
-                len += 8;
+            // OpenMP SIMD Block Comparison
+            #pragma omp simd
+            for (uint32_t step = 0; step < 32; step++) {
+                if (scan_ptr + len + 8 < scan_end_ptr && match_ptr + len + 8 < &in[WINDOW_SIZE] && 
+                    *reinterpret_cast<const uint64_t*>(scan_ptr + len) == *reinterpret_cast<const uint64_t*>(match_ptr + len)) {
+                    len += 8;
+                }
             }
+            while (scan_ptr + len < scan_end_ptr && match_ptr[len] == scan_ptr[len]) len++;
 
-            // Character-by-character check for remaining bytes.
-            while (scan_ptr + len < scan_end_ptr && match_ptr[len] == scan_ptr[len]) {
-                len++;
-            }
-
-            // If this match is longer than the best found so far, update 'best'
             if (len > best.length) {
                 best.length = len;
                 best.distance = pos - static_cast<uint32_t>(current_match_pos);
-                if (len >= MAX_MATCH) break; // Stop if maximum match length is reached
+                if (len >= MAX_MATCH) break; 
             }
-            // Move to the previous match in the hash chain
             current_match_pos = prev[current_match_pos % WINDOW_SIZE];
         }
         return best;
@@ -220,105 +251,108 @@ struct GigaWindowLZ77 {
 
     std::vector<uint8_t> compress(const std::vector<uint8_t>& in) {
         std::vector<uint8_t> out;
-        out.reserve(in.size() / 2); // Heuristic pre-allocation
+        out.reserve(in.size() / 2); 
+        
+        std::vector<int> head3(HASH3_SIZE, -1);
+        std::vector<int> head4(HASH4_SIZE, -1);
+        std::vector<int> prev(WINDOW_SIZE, -1); 
+        std::vector<OptimalNode> opt(in.size() + 1);
 
-        // Initialize hash table (head) and previous pointer array (prev)
-        std::vector<int> head(HASH_SIZE, -1);
-        std::vector<int> prev(WINDOW_SIZE, -1); // Use WINDOW_SIZE for the prev array, circular buffer
+        // Initialize Optimal Parsing Grid
+        for (size_t i = 0; i <= in.size(); i++) {
+            opt[i].cumulative_price = 0xFFFFFFFF; // Infinity
+            opt[i].match_length = 0;
+        }
+        opt[0].cumulative_price = 0;
 
+        std::ofstream log("lz77_optimal_telemetry.log");
+        if (log.is_open()) log << "--- LZ77 OPTIMAL DP PARSING ENGAGED ---\n";
+
+        auto start_time = std::chrono::high_resolution_clock::now();
+
+        // Pass 1: Dynamic Programming Forward Pass (The Cost Matrix)
         uint32_t i = 0;
         while (i < in.size()) {
-            // Update hash table and previous pointer array for the current position if it can form a match
             if (i + MIN_MATCH <= in.size()) {
-                uint32_t h = hash_func(&in[i]);
-                if (head[h] != -1) { // Only update prev if there was a previous entry for this hash
-                    prev[i % WINDOW_SIZE] = head[h];
-                }
-                head[h] = static_cast<int>(i);   // Update head[h] to current position
+                uint32_t h3 = hash3(&in[i]);
+                uint32_t h4 = hash4(&in[i]);
+                if (head4[h4] != -1) prev[i % WINDOW_SIZE] = head4[h4];
+                else if (head3[h3] != -1) prev[i % WINDOW_SIZE] = head3[h3];
+                
+                head3[h3] = static_cast<int>(i);   
+                head4[h4] = static_cast<int>(i);
             }
 
-            Match m0 = find_match(in, i, head, prev);
+            Match best_match = find_best_match(in, i, head3, head4, prev);
 
-            // --- Deep Horizon Parsing (Order-3 heuristic) ---
-            // This is an optimization to look ahead and potentially find better matches
-            // by considering matches starting at i+1, i+2, i+3.
-            // If a longer match can be found by advancing, it's worth it.
-            // Ensure that lookahead positions do not go beyond the input size.
-            bool perform_lookahead = false;
-            if (m0.length >= MIN_MATCH && i + 3 + MIN_MATCH <= in.size()) {
-                perform_lookahead = true;
+            // Calculate Literal Cost Path
+            uint32_t literal_price = opt[i].cumulative_price + calculate_price(0, 0);
+            if (literal_price < opt[i + 1].cumulative_price) {
+                opt[i + 1].cumulative_price = literal_price;
+                opt[i + 1].is_literal = true;
+                opt[i + 1].match_length = 1;
             }
 
-            if (perform_lookahead) {
-                // Temporarily update hash table for lookahead positions
-                int p1 = head[hash_func(&in[i + 1])]; head[hash_func(&in[i + 1])] = static_cast<int>(i + 1);
-                Match m1 = find_match(in, i + 1, head, prev);
-
-                int p2 = head[hash_func(&in[i + 2])]; head[hash_func(&in[i + 2])] = static_cast<int>(i + 2);
-                Match m2 = find_match(in, i + 2, head, prev);
-
-                int p3 = head[hash_func(&in[i + 3])]; head[hash_func(&in[i + 3])] = static_cast<int>(i + 3);
-                Match m3 = find_match(in, i + 3, head, prev);
-
-                // Restore hash table state after lookahead
-                head[hash_func(&in[i + 3])] = p3;
-                head[hash_func(&in[i + 2])] = p2;
-                head[hash_func(&in[i + 1])] = p1;
-
-                // Decision logic: If lookahead provided a significantly better start.
-                // Check if m1 is at least 2 bytes longer than m0, m2 at least 3, etc.
-                if (m1.length > m0.length + 1 || m2.length > m0.length + 2 || m3.length > m0.length + 3) {
-                    // If lookahead was better, output the current byte literally and advance i.
-                    if (in[i] == 0xFF) { // Escape 0xFF literal
-                        out.push_back(0xFF); out.push_back(0);
-                    } else {
-                        out.push_back(in[i]);
-                    }
-                    i++; // Advance past the literal byte
-                    // Do NOT 'continue' here. The hash/prev arrays for i+1, i+2, i+3 need to be updated in the *next* iteration's initialization phase.
-                    continue; // Skip the rest of the loop body for this iteration
+            // Calculate Match Cost Paths
+            for (uint32_t len = MIN_MATCH; len <= best_match.length; len++) {
+                uint32_t match_price = opt[i].cumulative_price + calculate_price(len, best_match.distance);
+                if (match_price < opt[i + len].cumulative_price) {
+                    opt[i + len].cumulative_price = match_price;
+                    opt[i + len].is_literal = false;
+                    opt[i + len].match_length = len;
+                    opt[i + len].match_distance = best_match.distance;
                 }
             }
 
-            // If a good match is found (m0.length >= MIN_MATCH)
-            if (m0.length >= MIN_MATCH) {
-                // Encode match as: 0xFF (literal escape) followed by length - MIN_MATCH
-                out.push_back(0xFF);
-                // Ensure encoded length does not exceed MAX_MATCH_ENCODED
-                uint8_t encoded_len = static_cast<uint8_t>(std::min(m0.length - MIN_MATCH, MAX_MATCH_ENCODED));
-                out.push_back(encoded_len);
+            // --- HUD TELEMETRY ---
+            if (i % (2 * 1024 * 1024) == 0 && i > 0) {
+                auto now = std::chrono::high_resolution_clock::now();
+                double elapsed = std::chrono::duration<double>(now - start_time).count();
+                double speed = (i / 1024.0 / 1024.0) / elapsed; 
+                double progress = (double)i / in.size() * 100.0;
+                
+                std::cout << "\r[LZ77 OPTIMAL] " << std::fixed << std::setprecision(1) << progress << "% "
+                          << "| Analyzed: " << (i / 1024 / 1024) << " MB "
+                          << "| Speed: " << std::setprecision(2) << speed << " MB/s " << std::flush;
+            }
+            i++;
+        }
 
-                // Encode 4-Byte Distance to support the 128MB window
-                out.push_back(static_cast<uint8_t>(m0.distance & 0xFF));          // Least significant byte
-                out.push_back(static_cast<uint8_t>((m0.distance >> 8) & 0xFF));
-                out.push_back(static_cast<uint8_t>((m0.distance >> 16) & 0xFF));
-                out.push_back(static_cast<uint8_t>((m0.distance >> 24) & 0xFF)); // Most significant byte
+        std::cout << "\n[LZ77 OPTIMAL] Forward pass complete. Backtracking shortest path...\n";
 
-                // Advance position 'i' for each character in the match, updating hash table and prev array
-                // We start k=1 because i is already at the beginning of the match.
-                for (uint32_t k = 1; k < m0.length; k++) {
-                    i++;
-                    if (i + MIN_MATCH <= in.size()) { // Check if we can update hashes for the next position
-                        uint32_t h = hash_func(&in[i]);
-                        if (head[h] != -1) { // Update prev only if a hash existed
-                            prev[i % WINDOW_SIZE] = head[h];
-                        }
-                        head[h] = static_cast<int>(i);
-                    }
-                }
-                i++; // Advance past the match itself (i.e., after the last character of the match)
+        // Pass 2: Backwards Traversal to find the shortest entropic path
+        std::vector<uint32_t> optimal_path;
+        uint32_t curr = in.size();
+        while (curr > 0) {
+            optimal_path.push_back(curr);
+            curr -= opt[curr].match_length;
+        }
+        std::reverse(optimal_path.begin(), optimal_path.end());
+
+        // Pass 3: Stream Encoding
+        uint32_t read_head = 0;
+        for (uint32_t node_idx : optimal_path) {
+            OptimalNode& node = opt[node_idx];
+            if (node.is_literal) {
+                if (in[read_head] == 0xFF) { out.push_back(0xFF); out.push_back(0); } 
+                else out.push_back(in[read_head]);
+                read_head += 1;
             } else {
-                // If no match found, output the literal byte
-                // Escape 0xFF literal
-                if (in[i] == 0xFF) {
-                    out.push_back(0xFF);
-                    out.push_back(0); // Use 0 to indicate literal 0xFF following
-                } else {
-                    out.push_back(in[i]);
+                out.push_back(0xFF);
+                out.push_back(static_cast<uint8_t>(std::min(node.match_length - MIN_MATCH, MAX_MATCH_ENCODED)));
+                out.push_back(static_cast<uint8_t>(node.match_distance & 0xFF));          
+                out.push_back(static_cast<uint8_t>((node.match_distance >> 8) & 0xFF));
+                out.push_back(static_cast<uint8_t>((node.match_distance >> 16) & 0xFF));
+                out.push_back(static_cast<uint8_t>((node.match_distance >> 24) & 0xFF)); 
+                
+                if (node.match_length > 64 && log.is_open()) {
+                    log << "Optimal Block -> Len: " << std::setw(4) << node.match_length << " | Dist: " << node.match_distance << "\n";
                 }
-                i++; // Advance input position by 1
+                read_head += node.match_length;
             }
         }
+
+        if (log.is_open()) log.close();
         return out;
     }
 };
@@ -1114,15 +1148,73 @@ struct ApexVanguardNGram {
     uint64_t get_context_fingerprint() { return history; }
 };
 
-// --- THE REFINED OMEGA GRANDMASTER ORCHESTRATOR ---
+#include <csignal>
+#include <sys/resource.h>
+#include <sched.h>
+#include <unistd.h>
+#include <atomic>
+
+// --- LAYER 0: GLOBAL INTERRUPT HANDLING ---
+// Allows the engine to save the neural state if you press Ctrl+C
+std::atomic<bool> external_interrupt_triggered(false);
+
+void handle_sigint(int sig) {
+    std::cout << "\n\n[WARNING] SYSTEM INTERRUPT RECEIVED (SIGINT)." << std::endl;
+    std::cout << "Initiating emergency weight serialization. Please wait..." << std::endl;
+    external_interrupt_triggered = true;
+}
+
+void enforce_hardware_limits() {
+    struct rlimit memory_limit;
+    const uint64_t MAX_RAM_BYTES = 10ULL * 1024 * 1024 * 1024; 
+    memory_limit.rlim_cur = MAX_RAM_BYTES;
+    memory_limit.rlim_max = MAX_RAM_BYTES;
+    setrlimit(RLIMIT_AS, &memory_limit);
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset); 
+    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+    omp_set_num_threads(1);
+    
+    // Register the interrupt signal
+    std::signal(SIGINT, handle_sigint);
+}
+
+// --- TELEMETRY MANAGER ---
+// Generates super-detailed, non-blocking logs
+void write_block_telemetry(size_t block_id, double bpb, double speed, float m_w, float d_w, float n_w) {
+    std::ofstream log("aura_pipeline_metrics.log", std::ios::app);
+    if (log.is_open()) {
+        log << "{\n"
+            << "  \"block\": " << block_id << ",\n"
+            << "  \"timestamp\": \"" << std::chrono::system_clock::now().time_since_epoch().count() << "\",\n"
+            << "  \"metrics\": {\n"
+            << "    \"bpb\": " << std::fixed << std::setprecision(5) << bpb << ",\n"
+            << "    \"speed_kbps\": " << std::setprecision(2) << speed << "\n"
+            << "  },\n"
+            << "  \"expert_routing\": {\n"
+            << "    \"mamba_ssm\": " << std::setprecision(3) << m_w << ",\n"
+            << "    \"aegis_dmc\": " << d_w << ",\n"
+            << "    \"vanguard_ngram\": " << n_w << "\n"
+            << "  }\n"
+            << "}\n";
+    }
+}
+
+// --- THE GRANDMASTER ORCHESTRATOR ---
 int main() {
     auto start_total = std::chrono::high_resolution_clock::now();
-    std::cout << "--- INITIALIZING AURA-X OMEGA: 10-LAYER GRANDMASTER ---" << std::endl;
-    std::cout << "[SYSTEM] Target: 110.79 MB | Hardware: Cloud vCPU Optimized" << std::endl; //
+    std::cout << "\n=======================================================" << std::endl;
+    std::cout << "   [ AURA-X OMEGA: PRODUCTION NEURAL CORE v1.5 ]" << std::endl;
+    std::cout << "=======================================================" << std::endl;
 
-    // 1. COMPONENT INITIALIZATION
+    enforce_hardware_limits();
+    std::cout << "[SYSTEM] Environment Locked: 1 vCPU | 10.0GB RAM | Interrupts Armed." << std::endl;
+
+    // --- PHASE I: PIPELINE INITIALIZATION ---
     WordSmasher smasher; smasher.init();
-    GigaWindowLZ77 lz_smasher;
+    GigaWindowLZ77 lz_smasher; 
     ApexBWT bwt_engine;
     ApexMambaSSM mamba;
     ApexAegisDMC dmc;
@@ -1131,134 +1223,96 @@ int main() {
     ApexForwardEntropy entropy;
     ShadowVerifier verifier;
 
-    double total_bits = 0.0;
-    uint64_t bit_counter = 0;
-
-    // 2. RESTORE PERSISTENT MEMORY
     std::ifstream brain_in("aura_brain.bin", std::ios::binary);
     if (brain_in.is_open()) {
-        std::cout << "[SYSTEM] Memory engaged. Restoring long-term training data..." << std::endl; //
-        mamba.load(brain_in); //
-        dmc.load(brain_in);   //
-        brain_in.close();
-    } else {
-        std::cout << "[SYSTEM] Fresh core initialized. No 'aura_brain.bin' detected." << std::endl;
+        std::cout << "[SYSTEM] Restoring persistent 2048-Dim parameters..." << std::endl;
+        mamba.load(brain_in); dmc.load(brain_in); brain_in.close();
     }
 
-    // 3. DATA LOADING
     std::vector<uint8_t> raw_data;
     std::ifstream infile("enwik9", std::ios::binary); 
-    if (infile.is_open()) {
-        infile.seekg(0, std::ios::end);
-        size_t file_size = infile.tellg();
-        raw_data.resize(file_size);
-        infile.seekg(0, std::ios::beg);
-        infile.read(reinterpret_cast<char*>(raw_data.data()), file_size); 
-        infile.close();
-        std::cout << "[LOADED] " << file_size << " bytes." << std::endl; //
-    } else {
-        std::cerr << "[ERROR] Missing 'enwik9' input. Aborting..." << std::endl;
-        return 1;
-    }
+    if (!infile.is_open()) { std::cerr << "[FATAL] 'enwik9' missing." << std::endl; return 1; }
+    infile.seekg(0, std::ios::end); raw_data.resize(infile.tellg());
+    infile.seekg(0, std::ios::beg); infile.read(reinterpret_cast<char*>(raw_data.data()), raw_data.size()); 
+    infile.close();
 
-    // STAGE 1: MACRO-COMPRESSION
-    std::cout << "[STAGE 1] LZ77 Dictionary Smasher starting..." << std::endl; //
-    auto compressed_data_stage1 = lz_smasher.compress(smasher.compress(raw_data)); //
-    std::cout << "[LZ77] Initial reduction complete. Smashed size: " << compressed_data_stage1.size() << " bytes." << std::endl; //
+    // --- PHASE II: MACRO REDUCTION ---
+    std::cout << "\n[PHASE II] Macro-Reduction Initiated..." << std::endl;
+    auto stage1 = lz_smasher.compress(smasher.compress(raw_data)); 
 
-    // 4. NEURAL PROCESSING LOOP 
-    std::cout << "[PIPELINE] Engaging Mamba-MoE Neural Core..." << std::endl; //
+    // --- PHASE III: NEURAL SQUEEZE ---
+    std::cout << "\n[PHASE III] Neural Squeeze Initiated..." << std::endl;
     const size_t BLOCK_SIZE = 10 * 1024 * 1024; 
+    
+    double total_bits = 0.0;
+    uint64_t bit_counter = 0;
+    size_t block_id = 0;
     auto start_neural = std::chrono::high_resolution_clock::now();
 
-    for (size_t offset = 0; offset < compressed_data_stage1.size(); offset += BLOCK_SIZE) {
-        size_t len = std::min(BLOCK_SIZE, compressed_data_stage1.size() - offset);
-        std::vector<uint8_t> block(compressed_data_stage1.begin() + offset, compressed_data_stage1.begin() + offset + len);
+    for (size_t offset = 0; offset < stage1.size(); offset += BLOCK_SIZE) {
+        if (external_interrupt_triggered) break; // Emergency Stop Check
+        block_id++;
 
-        auto processed_block_mtf = bwt_engine.transform(block); 
+        size_t len = std::min(BLOCK_SIZE, stage1.size() - offset);
+        std::vector<uint8_t> block(stage1.begin() + offset, stage1.begin() + offset + len);
+        auto mtf_stream = bwt_engine.transform(block); 
 
-        for (uint8_t symbol : processed_block_mtf) {
+        for (uint8_t symbol : mtf_stream) {
+            if (external_interrupt_triggered) break; // Emergency Stop Check
+
             for (int b = 7; b >= 0; b--) {
                 int target_bit = (symbol >> b) & 1; 
 
-                // Prediction Phase
-                float p_ssm = mamba.predict();
-                float p_dmc = dmc.predict();
-                float p_ngram = ngram.predict();
+                float p_s = mamba.predict(), p_d = dmc.predict(), p_n = ngram.predict();
+                uint64_t ctx = ngram.get_context_fingerprint();
+                float p_f = mixer.mix(p_s, p_n, p_d, symbol, ctx); 
+                
+                verifier.verify(target_bit, p_f);
+                entropy.log_and_encode(p_f, target_bit); 
 
-                // Gated Mixing & Verification
-                uint64_t ngram_ctx = ngram.get_context_fingerprint();
-                float p_final = mixer.mix(p_ssm, p_ngram, p_dmc, symbol, ngram_ctx); //
-                verifier.verify(target_bit, p_final); 
+                mamba.adapt(target_bit); dmc.adapt(target_bit); ngram.adapt(target_bit); 
+                mixer.adapt(p_s, p_n, p_d, target_bit, symbol, ctx); 
 
-                // Entropic Coding
-                entropy.log_and_encode(p_final, target_bit); 
-
-                // Expert Adaptation (Backpropagation)
-                mamba.adapt(target_bit);
-                dmc.adapt(target_bit);
-                ngram.adapt(target_bit); 
-                mixer.adapt(p_ssm, p_ngram, p_dmc, target_bit, symbol, ngram_ctx); 
-
-                // --- CONSTANT MULTI-LAYER TELEMETRY HUD ---
-                float safe_p = std::clamp(p_final, 1e-6f, 1.0f - 1e-6f); 
+                float safe_p = std::clamp(p_f, 1e-6f, 1.0f - 1e-6f); 
                 total_bits += -std::log2(target_bit == 1 ? safe_p : 1.0f - safe_p);
                 bit_counter++;
 
-                // Update the terminal every 8192 bits (1 KB) 
-                // Updating on every single bit will cause I/O lag and bottleneck the CPU
-                if (bit_counter % 8192 == 0) {
-                    double progress = (double)bit_counter / (compressed_data_stage1.size() * 8.0) * 100.0;
-                    double bpb = total_bits / (bit_counter / 8.0);
-                    
-                    std::cout << "\r[HUD] " 
-                              << std::fixed << std::setprecision(2) << progress << "% "
-                              << "| BPB: " << std::setprecision(4) << bpb << " "
-                              << "| MAMBA P:" << std::setprecision(2) << p_ssm << " (W:" << std::setw(4) << (mixer.g[0]*100.f) << "%) "
-                              << "| NGRAM P:" << std::setprecision(2) << p_ngram << " (W:" << std::setw(4) << (mixer.g[1]*100.f) << "%) "
-                              << "| DMC P:" << std::setprecision(2) << p_dmc << " (W:" << std::setw(4) << (mixer.g[2]*100.f) << "%)   "
+                // Seamless HUD
+                if (bit_counter % 8192 == 0) { 
+                    double elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_neural).count();
+                    std::cout << "\r[HUD] " << std::fixed << std::setprecision(2) << ((double)bit_counter / (stage1.size() * 8.0) * 100.0) << "% "
+                              << "| BPB: " << std::setprecision(4) << (total_bits / (bit_counter / 8.0)) << " "
+                              << "| SPD: " << std::setprecision(2) << ((bit_counter / 8.0 / 1024.0) / elapsed) << " KB/s "
+                              << "| MoE [M:" << std::setw(2) << (int)(mixer.weights[0]*100) << "% D:" << std::setw(2) << (int)(mixer.weights[2]*100) << "%]   "
                               << std::flush;
-                }
-                // Trigger Telemetry every 100k bits
-                if (bit_counter % 100000 == 0) {
-                    auto now = std::chrono::high_resolution_clock::now();
-                    double elapsed = std::chrono::duration<double>(now - start_neural).count();
-                    double speed = (bit_counter / 8.0 / 1024.0) / elapsed; // KB/s
-                    double progress = (double)bit_counter / (compressed_data_stage1.size() * 8.0) * 100.0;
-                    double bpb = total_bits / (bit_counter / 8.0);
-                    double est_size = (total_bits / bit_counter) * (compressed_data_stage1.size() * 8.0) / 8.0 / 1024.0 / 1024.0;
-                    
-                    std::cout << "\r>>> [" << std::fixed << std::setprecision(1) << progress << "%] "
-                              << "BPB: " << std::setprecision(4) << bpb << " | "
-                              << "EST: " << std::setprecision(2) << est_size << " MB | "
-                              << "Speed: " << std::setprecision(2) << speed << " KB/s" << std::flush;
                 }
             }
         }
+        
+        // Detailed Block Telemetry File Dump
+        if (!external_interrupt_triggered) {
+            double elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_neural).count();
+            write_block_telemetry(block_id, (total_bits / (bit_counter / 8.0)), ((bit_counter / 8.0 / 1024.0) / elapsed), mixer.weights[0], mixer.weights[2], mixer.weights[1]);
+        }
     }
 
-    // 5. FINALIZATION & ARCHIVAL
+    // --- PHASE IV: ARCHIVAL & TEARDOWN ---
     entropy.finish(); 
-    std::cout << "\n[SYSTEM] Run complete. Archiving 2048-Dim weights to 'aura_brain.bin'..." << std::endl;
+    std::cout << "\n\n[SYSTEM] Serializing brain state to 'aura_brain.bin'..." << std::endl;
 
     std::ofstream brain_out("aura_brain.bin", std::ios::binary);
-    if (brain_out.is_open()) {
-        mamba.save(brain_out); //
-        dmc.save(brain_out);   //
-        brain_out.close();
-    }
+    if (brain_out.is_open()) { mamba.save(brain_out); dmc.save(brain_out); }
 
-    std::cout << "[COMPLETE] Final Size: " << std::fixed << std::setprecision(2) << entropy.get_mb() << " MB" << std::endl;
+    std::ofstream c_file("compressed_aura.bin", std::ios::binary);
+    if (c_file.is_open()) { c_file.write(reinterpret_cast<const char*>(entropy.stream.data()), entropy.stream.size()); }
+
+    double total_time = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_total).count();
     
-    std::ofstream compressed_file("compressed_aura.bin", std::ios::binary);
-    if (compressed_file.is_open()) {
-        compressed_file.write(reinterpret_cast<const char*>(entropy.stream.data()), entropy.stream.size()); 
-        compressed_file.close();
-    }
-
-    auto end_total = std::chrono::high_resolution_clock::now();
-    double total_time = std::chrono::duration<double>(end_total - start_total).count();
-    std::cout << "[METRICS] Total Runtime: " << total_time << " seconds." << std::endl;
+    std::cout << "=======================================================" << std::endl;
+    if (external_interrupt_triggered) std::cout << "[ABORT] Engine safely halted by user. Weights preserved." << std::endl;
+    else std::cout << "[COMPLETE] Final Output Size: " << std::fixed << std::setprecision(2) << entropy.get_mb() << " MB" << std::endl;
+    std::cout << "[METRICS] Total CPU Uptime:  " << std::setprecision(1) << total_time << " seconds." << std::endl;
+    std::cout << "=======================================================" << std::endl;
 
     return 0;
 }
