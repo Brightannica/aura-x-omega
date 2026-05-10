@@ -183,7 +183,7 @@ struct GigaWindowLZ77 {
     static const uint32_t HASH4_SIZE = 33554432; // 32M
     
     // SIMD-Aligned Optimal Parsing Grid
-    alignas(64) struct OptimalNode {
+    struct alignas(64) OptimalNode {
         uint32_t cumulative_price;
         uint32_t match_length;
         uint32_t match_distance;
@@ -1164,23 +1164,6 @@ void handle_sigint(int sig) {
     external_interrupt_triggered = true;
 }
 
-void enforce_hardware_limits() {
-    struct rlimit memory_limit;
-    const uint64_t MAX_RAM_BYTES = 10ULL * 1024 * 1024 * 1024; 
-    memory_limit.rlim_cur = MAX_RAM_BYTES;
-    memory_limit.rlim_max = MAX_RAM_BYTES;
-    setrlimit(RLIMIT_AS, &memory_limit);
-
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(0, &cpuset); 
-    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
-    omp_set_num_threads(1);
-    
-    // Register the interrupt signal
-    std::signal(SIGINT, handle_sigint);
-}
-
 // --- TELEMETRY MANAGER ---
 // Generates super-detailed, non-blocking logs
 void write_block_telemetry(size_t block_id, double bpb, double speed, float m_w, float d_w, float n_w) {
@@ -1283,7 +1266,7 @@ int main() {
                     std::cout << "\r[HUD] " << std::fixed << std::setprecision(2) << ((double)bit_counter / (stage1.size() * 8.0) * 100.0) << "% "
                               << "| BPB: " << std::setprecision(4) << (total_bits / (bit_counter / 8.0)) << " "
                               << "| SPD: " << std::setprecision(2) << ((bit_counter / 8.0 / 1024.0) / elapsed) << " KB/s "
-                              << "| MoE [M:" << std::setw(2) << (int)(mixer.weights[0]*100) << "% D:" << std::setw(2) << (int)(mixer.weights[2]*100) << "%]   "
+                              << "| MoE [M:" << std::setw(2) << (int)(mixer.g[0]*100) << "% D:" << std::setw(2) << (int)(mixer.g[2]*100) << "%]   "
                               << std::flush;
                 }
             }
@@ -1292,7 +1275,7 @@ int main() {
         // Detailed Block Telemetry File Dump
         if (!external_interrupt_triggered) {
             double elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_neural).count();
-            write_block_telemetry(block_id, (total_bits / (bit_counter / 8.0)), ((bit_counter / 8.0 / 1024.0) / elapsed), mixer.weights[0], mixer.weights[2], mixer.weights[1]);
+            write_block_telemetry(block_id, (total_bits / (bit_counter / 8.0)), ((bit_counter / 8.0 / 1024.0) / elapsed), mixer.g[0], mixer.g[2], mixer.g[1]);
         }
     }
 
