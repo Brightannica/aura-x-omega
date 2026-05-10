@@ -1185,6 +1185,20 @@ void write_block_telemetry(size_t block_id, double bpb, double speed, float m_w,
     }
 }
 
+// Paste this directly ABOVE int main()
+void stream_detailed_telemetry(uint64_t bit_counter, double bpb, float p_s, float p_d, float p_n, float p_f, int target_bit, float m_w, float d_w, float n_w) {
+    std::ofstream log("aura_detailed_stream.log", std::ios::app);
+    if (log.is_open()) {
+        log << "[BIT " << std::setw(10) << bit_counter << "] "
+            << "Bit=" << target_bit << " | "
+            << "Final_P=" << std::fixed << std::setprecision(4) << p_f << " | "
+            << "BPB=" << std::setprecision(5) << bpb << " || "
+            << "MAMBA_P=" << p_s << " (W:" << std::setprecision(2) << m_w << ") | "
+            << "DMC_P=" << p_d << " (W:" << d_w << ") | "
+            << "NGRAM_P=" << p_n << " (W:" << n_w << ")\n";
+    }
+}
+
 // --- THE GRANDMASTER ORCHESTRATOR ---
 int main() {
     auto start_total = std::chrono::high_resolution_clock::now();
@@ -1259,6 +1273,13 @@ int main() {
                 float safe_p = std::clamp(p_f, 1e-6f, 1.0f - 1e-6f); 
                 total_bits += -std::log2(target_bit == 1 ? safe_p : 1.0f - safe_p);
                 bit_counter++;
+
+                // --- SUPER DETAILED ACTIVE LOGGING ---
+                // Logs every 32KB to keep the file detailed but prevent disk freezing
+                if (bit_counter % 262144 == 0 && !external_interrupt_triggered) {
+                    double current_bpb = total_bits / (bit_counter / 8.0);
+                    stream_detailed_telemetry(bit_counter, current_bpb, p_s, p_d, p_n, p_f, target_bit, mixer.g[0], mixer.g[2], mixer.g[1]);
+                }
 
                 // Seamless HUD
                 if (bit_counter % 8192 == 0) { 
